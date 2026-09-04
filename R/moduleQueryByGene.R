@@ -103,7 +103,7 @@ queryGeneAcrossDatasetsServer <- function(id, pkg = utils::packageName()) {
 
     # ---- safe pkg string ----
     pkg <- tryCatch(pkg, error = function(e) "")
-    if (!length(pkg) || !is.character(pkg) || !nzchar(pkg)) pkg <- "SOD1_main"
+    if (!length(pkg) || !is.character(pkg) || !nzchar(pkg)) pkg <- "SOD1main"
     pkg <- pkg[[1L]]
 
     # ---- helpers ----

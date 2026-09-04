@@ -76,13 +76,13 @@ degTablesMainUI <- function(id) {
 #' Server logic for DEG-by-dataset (robust for package + project)
 #' @noRd
 #'
-degTablesServer <- function(id, pkg = "SOD1_main") {
+degTablesServer <- function(id, pkg = "SOD1main") {
   moduleServer(id, function(input, output, session) {
     ns <- session$ns
 
     # --- make pkg safe (length-1 string) ---------------------------------
     pkg <- tryCatch(pkg, error = function(e) "")
-    if (!length(pkg) || !is.character(pkg) || !nzchar(pkg)) pkg <- "SOD1_main"
+    if (!length(pkg) || !is.character(pkg) || !nzchar(pkg)) pkg <- "SOD1main"
     pkg <- pkg[[1L]]
 
 

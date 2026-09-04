@@ -1,4 +1,4 @@
-Package: SOD1_main
+Package: SOD1main
 Title: XXXX
 Version: 1.0.0
 Authors@R: c(person("Marnie", "Maddock", role = c("aut","cre"), email = "mlm715@uowmail.edu.au"))

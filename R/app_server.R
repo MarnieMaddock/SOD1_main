@@ -8,7 +8,7 @@
 app_server <- function(input, output, session) {
   # --- make `pkg` robust for both project + installed package modes ----
   pkg <- tryCatch(utils::packageName(), error = function(e) "")
-  if (!length(pkg) || !is.character(pkg) || !nzchar(pkg)) pkg <- "SOD1_main"
+  if (!length(pkg) || !is.character(pkg) || !nzchar(pkg)) pkg <- "SOD1main"
   pkg <- pkg[[1L]]  # ensure length 1
 
   pkg_www <- system.file("www", package = pkg, mustWork = FALSE)

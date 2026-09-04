@@ -153,7 +153,7 @@ GSEAServer <- function(id, base_dir = NULL, pkg = NULL) {
     # ---- make `pkg` safe here too ----
     if (is.null(pkg) || !is.character(pkg) || !nzchar(pkg)) {
       pkg <- tryCatch(utils::packageName(), error = function(e) "")
-      if (!length(pkg) || !nzchar(pkg)) pkg <- "SOD1_main"
+      if (!length(pkg) || !nzchar(pkg)) pkg <- "SOD1main"
       pkg <- pkg[[1L]]  # ensure length 1
     }
 

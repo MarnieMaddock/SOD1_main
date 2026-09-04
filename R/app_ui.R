@@ -14,7 +14,7 @@ get_logo_path <- function() {
   if (file.exists("inst/www/dottori_lab_pentagon.svg")) {
     return("inst/www/dottori_lab_pentagon.svg")  # shinyapps.io
   } else {
-    return(system.file("www", "dottori_lab_pentagon.svg", package = "SOD1_main"))  # GitHub / package
+    return(system.file("www", "dottori_lab_pentagon.svg", package = "SOD1main"))  # GitHub / package
   }
 }
 
@@ -22,7 +22,7 @@ get_UOW_path <- function() {
   if (file.exists("inst/www/UOW.png")) {
     return("inst/www/UOW.png")  # shinyapps.io
   } else {
-    return(system.file("www", "UOW.png", package = "SOD1_main"))
+    return(system.file("www", "UOW.png", package = "SOD1main"))
   }
 }
 
@@ -30,7 +30,7 @@ get_css_path <- function() {
   if (file.exists("inst/www/style.css")) {
     return("inst/www/style.css")  # shinyapps.io
   } else {
-    return(system.file("www", "style.css", package = "SOD1_main"))
+    return(system.file("www", "style.css", package = "SOD1main"))
   }
 }
 

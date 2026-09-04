@@ -47,13 +47,13 @@ genePlotsMainUI <- function(id) {
 
 #' Gene Plots server - multi-dataset (checkboxes)
 #' @noRd
-genePlotsServer <- function(id, pkg = "SOD1_main"){
+genePlotsServer <- function(id, pkg = "SOD1main"){
 
   moduleServer(id, function(input, output, session) {
 
     pkg <- tryCatch(pkg, error = function(e) "")
     if (!length(pkg) || !is.character(pkg) || !nzchar(pkg)) {
-      pkg <- "SOD1_main"
+      pkg <- "SOD1main"
     }
     pkg <- pkg[[1L]]
     pretty_map <- c(
