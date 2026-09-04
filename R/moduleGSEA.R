@@ -1,0 +1,793 @@
+#moduleGSEA.R
+# R/modules/goGSEA_module.R
+# -------------------------
+
+# Sidebar controls
+GSEASidebarUI <- function(id) {
+  ns <- shiny::NS(id)
+  tagList(
+    selectInput(ns("dataset"), "Dataset", choices = NULL),
+    radioButtons(
+      ns("ont"),
+      "Gene set collection",
+      choices = c(
+        "GO: Biological Process" = "BP",
+        "GO: Cellular Component" = "CC",
+        "GO: Molecular Function" = "MF",
+        "KEGG" = "KEGG",
+        "Reactome" = "Reactome",
+        "Transcription factors (GTRD)" = "TF_GTRD"
+      ),
+      inline = TRUE
+    ),
+    br(),
+    sliderInput(ns("ncat"), "Show top categories",
+                min = 2, max = 500, value = 10, step = 1),
+    br(),
+    checkboxInput(
+      ns("sig_only"),
+      "Show only FDR < 0.05",
+      value = TRUE
+    ),
+    tags$hr(),
+    br(),
+  )
+}
+GSEAMainUI <- function(id) {
+  ns <- shiny::NS(id)
+  tagList(
+    h4("Dotplot (GeneRatio)"),
+    uiOutput(ns("plot_gr_ui")),
+    div(class = "text-center mt-2",
+        downloadButton(ns("dl_plot_gr_png"), "Download PNG", class = "btn-sm"),
+        downloadButton(ns("dl_plot_gr_svg"), "Download SVG", class = "btn-sm")
+    ),
+    hr(),
+    h4("Dotplot (NES)"),
+    uiOutput(ns("plot_nes_ui")),
+    div(class = "text-center mt-2",
+        downloadButton(ns("dl_plot_nes_png"), "Download PNG", class = "btn-sm"),
+        downloadButton(ns("dl_plot_nes_svg"), "Download SVG", class = "btn-sm")
+    ),
+    hr(),
+    uiOutput(ns("results_heading")),
+    shinycssloaders::withSpinner(
+      DT::DTOutput(ns("tbl")),
+      type = 4, color = "#005249"
+    ),
+    div(class = "text-center mt-2",
+        downloadButton(ns("dl_table_csv"), "Download table (CSV)", class = "btn-sm"),
+        div(class = "text-muted small",
+            "Tip: click a row in the table, then use `Show genes` or `Download genes (CSV)`."),
+
+        actionButton(ns("show_genes"), "Show genes for selected term", class = "btn-sm"),
+        downloadButton(ns("dl_genes_csv"), "Download genes (CSV)", class = "btn-sm")
+    ),
+    br()
+  )
+}
+
+
+
+# R/modules/goGSEA_module.R
+# -------------------------
+# Server for GSEA (CSV/RDS-on-disk, on-demand)
+GSEAServer <- function(id, base_dir = NULL, pkg = NULL) {
+  moduleServer(id, function(input, output, session) {
+    ns <- session$ns
+
+    # --- maps (tx2gene) ---
+    tx2_path <- system.file("extdata/maps/tx2gene.tsv", package = pkg, mustWork = FALSE)
+    if (!nzchar(tx2_path)) tx2_path <- file.path("inst", "extdata", "maps", "tx2gene.tsv")
+
+    tx2gene <- if (nzchar(tx2_path) && file.exists(tx2_path)) {
+      readr::read_tsv(tx2_path, col_types = "ccc") |>
+        dplyr::mutate(
+          transcript_id = sub("\\.\\d+$","", transcript_id),
+          gene_id       = sub("\\.\\d+$","", gene_id)
+        )
+    } else NULL
+
+    norm_id <- function(x) sub("\\.\\d+$","", as.character(x))
+
+    # ENSEMBL -> SYMBOL lookup (vector)
+    ensg_to_symbol <- if (!is.null(tx2gene) && all(c("gene_id","gene_name") %in% names(tx2gene))) {
+      ids  <- norm_id(tx2gene$gene_id)
+      syms <- as.character(tx2gene$gene_name)
+      keep <- !duplicated(ids)
+      stats::setNames(syms[keep], ids[keep])
+    } else stats::setNames(character(0), character(0))
+
+    # Vectorized mapper (returns symbol; if missing, returns cleaned id)
+    # map_ids_to_symbol <- function(ids) {
+    #   if (!length(ids)) return(character())
+    #   ids2 <- norm_id(ids)
+    #   hit  <- ensg_to_symbol[ids2]
+    #   out  <- ifelse(is.na(hit) | !nzchar(hit), ids2, unname(hit))
+    #   out
+    # }
+    
+    map_ids_to_symbol <- function(ids) {
+      if (!length(ids)) return(character())
+      
+      ids_chr <- as.character(ids)
+      is_entrez <- grepl("^[0-9]+$", ids_chr)
+      
+      out <- ids_chr
+      
+      # Entrez ID -> Symbol
+      if (any(is_entrez)) {
+        entrez_map <- suppressMessages(
+          AnnotationDbi::mapIds(
+            org.Hs.eg.db::org.Hs.eg.db,
+            keys = ids_chr[is_entrez],
+            column = "SYMBOL",
+            keytype = "ENTREZID",
+            multiVals = "first"
+          )
+        )
+        
+        out[is_entrez] <- ifelse(
+          is.na(entrez_map),
+          ids_chr[is_entrez],
+          unname(entrez_map)
+        )
+      }
+      
+      # ENSEMBL ID -> Symbol using your tx2gene lookup
+      if (any(!is_entrez)) {
+        ids2 <- norm_id(ids_chr[!is_entrez])
+        hit <- ensg_to_symbol[ids2]
+        
+        out[!is_entrez] <- ifelse(
+          is.na(hit) | !nzchar(hit),
+          ids2,
+          unname(hit)
+        )
+      }
+      
+      out
+    }
+
+
+    # ---- make `pkg` safe here too ----
+    if (is.null(pkg) || !is.character(pkg) || !nzchar(pkg)) {
+      pkg <- tryCatch(utils::packageName(), error = function(e) "")
+      if (!length(pkg) || !nzchar(pkg)) pkg <- "SOD1_main"
+      pkg <- pkg[[1L]]  # ensure length 1
+    }
+
+    # optional: guard for pretty_map if it isn't globally defined
+    pretty_map <- tryCatch(
+      get("pretty_map", envir = asNamespace(pkg)),
+      error = function(e) character(0)
+    )
+
+    # ---- deps ----
+    requireNamespace("DT", quietly = TRUE)
+    requireNamespace("ggplot2", quietly = TRUE)
+    requireNamespace("svglite", quietly = TRUE)
+
+
+    `%||%` <- function(x,y) if (is.null(x) || (is.character(x) && !nzchar(x))) y else x
+
+    # --- helper: extract core genes vector from a one-row data.frame
+    .extract_genes_raw <- function(rowdf) {
+      if (nrow(rowdf) < 1) return(character())
+      col <- if ("core_enrichment" %in% names(rowdf)) "core_enrichment"
+      else if ("geneID" %in% names(rowdf)) "geneID" else return(character())
+      unique(norm_id(strsplit(as.character(rowdf[[col]][[1]]), "/", fixed = TRUE)[[1]]))
+    }
+
+    # .add_core_cols <- function(df) {
+    #   if (!nrow(df)) return(df)
+    #   col <- if ("core_enrichment" %in% names(df)) "core_enrichment"
+    #   else if ("geneID" %in% names(df)) "geneID" else return(df)
+    # 
+    #   sp <- strsplit(as.character(df[[col]]), "/", fixed = TRUE)
+    #   genes_list   <- lapply(sp, function(v) unique(norm_id(v[nzchar(v)])))
+    #   symbols_list <- lapply(genes_list, map_ids_to_symbol)
+    # 
+    #   df$core_count   <- vapply(genes_list, length, integer(1))
+    #   df$core_preview <- vapply(symbols_list, function(v) {
+    #     if (!length(v)) return("")
+    #     paste0(paste(utils::head(v, 8), collapse = ", "),
+    #            if (length(v) > 8) sprintf(" ... (+%d)", length(v) - 8) else "")
+    #   }, character(1))
+    #   df
+    # }
+    
+    .add_core_cols <- function(df) {
+      if (!nrow(df)) return(df)
+      
+      col <- if ("core_enrichment" %in% names(df)) {
+        "core_enrichment"
+      } else if ("geneID" %in% names(df)) {
+        "geneID"
+      } else {
+        return(df)
+      }
+      
+      sp <- strsplit(as.character(df[[col]]), "/", fixed = TRUE)
+      genes_list <- lapply(sp, function(v) unique(norm_id(v[nzchar(v)])))
+      
+      # Collect all unique IDs once
+      all_ids <- unique(unlist(genes_list))
+      is_entrez <- grepl("^[0-9]+$", all_ids)
+      
+      symbol_lookup <- stats::setNames(all_ids, all_ids)
+      
+      # Map all Entrez IDs in one call
+      if (any(is_entrez)) {
+        entrez_ids <- all_ids[is_entrez]
+        
+        entrez_map <- suppressMessages(
+          AnnotationDbi::mapIds(
+            org.Hs.eg.db::org.Hs.eg.db,
+            keys = entrez_ids,
+            column = "SYMBOL",
+            keytype = "ENTREZID",
+            multiVals = "first"
+          )
+        )
+        
+        mapped <- ifelse(
+          is.na(entrez_map) | !nzchar(entrez_map),
+          entrez_ids,
+          unname(entrez_map)
+        )
+        
+        symbol_lookup[entrez_ids] <- mapped
+      }
+      
+      # Map all Ensembl IDs using existing lookup
+      if (any(!is_entrez)) {
+        ensembl_ids <- all_ids[!is_entrez]
+        ids2 <- norm_id(ensembl_ids)
+        hit <- ensg_to_symbol[ids2]
+        
+        mapped <- ifelse(
+          is.na(hit) | !nzchar(hit),
+          ids2,
+          unname(hit)
+        )
+        
+        symbol_lookup[ensembl_ids] <- mapped
+      }
+      
+      # Reuse lookup for every pathway
+      symbols_list <- lapply(
+        genes_list,
+        function(v) unname(symbol_lookup[v])
+      )
+      
+      df$core_count <- vapply(genes_list, length, integer(1))
+      
+      df$core_preview <- vapply(
+        symbols_list,
+        function(v) {
+          if (!length(v)) return("")
+          
+          paste0(
+            paste(utils::head(v, 8), collapse = ", "),
+            if (length(v) > 8) {
+              sprintf(" ... (+%d)", length(v) - 8)
+            } else {
+              ""
+            }
+          )
+        },
+        character(1)
+      )
+      
+      df
+    }
+    # ---- index builders ----
+
+    build_index_local <- function(root) {
+      if (!dir.exists(root)) return(list())
+
+      ds_dirs <- list.dirs(root, recursive = FALSE, full.names = TRUE)
+
+      idx <- lapply(ds_dirs, function(d) {
+        map <- stats::setNames(vector("list", 3), c("BP", "CC", "MF"))
+
+        for (ont in c("BP", "CC", "MF")) {
+          p_rds <- file.path(d, sprintf("gsea_GO_%s.rds", ont))
+
+          if (file.exists(p_rds)) {
+            map[[ont]] <- p_rds
+          } else {
+            map[[ont]] <- ""
+          }
+        }
+
+        map
+      })
+
+      names(idx) <- basename(ds_dirs)
+
+      idx[vapply(idx, function(x) any(nzchar(unlist(x))), logical(1))]
+    }
+
+
+    build_index_cloud <- function(manifest) {
+
+      required_cols <- c("dataset", "ont", "filename")
+      missing_cols <- setdiff(required_cols, names(manifest))
+
+      if (length(missing_cols) > 0) {
+        stop(
+          "GSEA cloud manifest is missing required columns: ",
+          paste(missing_cols, collapse = ", "),
+          call. = FALSE
+        )
+      }
+
+      manifest <- manifest |>
+        dplyr::filter(
+          .data$ont %in% c("BP", "CC", "MF", "KEGG", "Reactome", "TF_GTRD"),
+          !is.na(.data$dataset),
+          !is.na(.data$filename)
+        )
+
+      datasets <- unique(manifest$dataset)
+
+      idx <- lapply(datasets, function(ds) {
+        onts <- c("BP", "CC", "MF", "KEGG", "Reactome", "TF_GTRD")
+        map <- stats::setNames(vector("list", length(onts)), onts)
+        
+        for (ont in onts) {
+          row <- manifest |>
+            dplyr::filter(
+              .data$dataset == .env$ds,
+              .data$ont == .env$ont
+            ) |>
+            dplyr::slice(1)
+
+          if (nrow(row) == 1) {
+            map[[ont]] <- row$filename[[1]]
+          } else {
+            map[[ont]] <- ""
+          }
+        }
+
+        map
+      })
+
+      names(idx) <- datasets
+
+      idx[vapply(idx, function(x) any(nzchar(unlist(x))), logical(1))]
+    }
+    
+    gsea_manifest <- get_gsea_manifest_cloud()
+    idx <- build_index_cloud(gsea_manifest)
+
+    datasets_vec <- names(idx)
+
+    # ---- pretty labels for the dataset select ----
+    # expects a global/internal object `pretty_map` (named character vector)
+    # ---- pretty labels for the dataset select (dataset_key3) ----
+    # keep up to first 3 tokens (e.g., "Lees_FA1", "Maddock_SN_FA2")
+    dataset_key3 <- function(x) {
+      b <- basename(x)
+      b <- sub("\\.rds$", "", b)
+
+      # remove trailing analysis suffix like _0.05_all_genes
+      b <- sub("_[0-9]+\\.[0-9]+_all_genes$", "", b)
+
+      b
+    }
+
+    labels <- vapply(datasets_vec, function(d) {
+      key <- dataset_key3(d)
+      lbl <- unname(pretty_map[key])
+
+      if (length(lbl) == 0 || is.na(lbl) || !nzchar(lbl)) {
+        gsub("_", " ", key)
+      } else {
+        lbl
+      }
+    }, character(1))
+
+    choices_named <- stats::setNames(datasets_vec, labels)
+
+    label_from_value <- stats::setNames(labels, datasets_vec)
+    observe({
+      validate(
+        need(length(datasets_vec) > 0, "No GSEA files found.")
+      )
+
+      updateSelectInput(
+        session,
+        "dataset",
+        choices = choices_named,
+        selected = datasets_vec[[1]]
+      )
+    })
+    # ---- reactive: are we safe to render? ----
+
+    ready <- reactive({
+      !is.null(input$dataset) &&
+        input$dataset %in% datasets_vec &&
+        !is.null(input$ont) &&
+        input$ont %in% c("BP", "CC", "MF", "KEGG", "Reactome", "TF_GTRD") &&
+        nzchar(idx[[input$dataset]][[input$ont]])
+    })
+
+    r_path <- reactive({
+      req(ready())
+
+      p <- idx[[input$dataset]][[input$ont]]
+
+      p
+    })
+
+    read_any <- function(p) {
+      get_gsea_data_cloud_cached(p)
+    }
+
+    r_obj <- reactive({
+      req(ready())
+      read_any(r_path())
+    })
+
+    r_df <- reactive({
+      x <- r_obj()
+      
+      df <- if (is.data.frame(x)) {
+        x
+      } else {
+        as.data.frame(x)
+      }
+      
+      # Optional FDR filter
+      if (
+        isTRUE(input$sig_only) &&
+        "p.adjust" %in% names(df)
+      ) {
+        df <- df[
+          !is.na(df$p.adjust) & df$p.adjust < 0.05,
+          ,
+          drop = FALSE
+        ]
+      }
+      
+      # Sort by adjusted p-value, then absolute NES
+      if ("p.adjust" %in% names(df)) {
+        df <- df[
+          order(df$p.adjust, -abs(df$NES %||% 0)),
+          ,
+          drop = FALSE
+        ]
+      }
+      
+      .add_core_cols(df)
+    })
+
+    # ---- title ----
+    title_txt <- reactive({
+      ds_label <- label_from_value[[input$dataset %||% ""]] %||% (input$dataset %||% "")
+      paste0(ds_label, " - ", input$ont %||% "", " GSEA")
+    })
+
+
+
+
+    # ---- plot helpers ----
+    # ---- plot helpers ----
+    make_dotplot <- function(metric = c("GeneRatio","NES")) {
+      metric <- match.arg(metric)
+
+
+      # ----------------------------
+      # data.frame CSV results
+      # ----------------------------
+      df <- r_df()
+      n  <- max(1, as.integer(input$ncat %||% 10))
+      d <- df |>
+        dplyr::arrange(p.adjust) |>
+        dplyr::slice_head(n = n)
+
+      if (!"GeneRatio" %in% names(d)) {
+        if ("core_enrichment" %in% names(d) && "setSize" %in% names(d)) {
+          core_n <- vapply(
+            strsplit(as.character(d$core_enrichment), "/", fixed = TRUE),
+            function(v) sum(nzchar(v)),
+            integer(1)
+          )
+          d$GeneRatio <- core_n / as.numeric(d$setSize)
+        }
+      }
+
+      metric_col <- switch(
+        metric,
+        GeneRatio = "GeneRatio",
+        NES = "NES"
+      )
+
+      validate(
+        need(metric_col %in% names(d), sprintf("Metric '%s' not available.", metric)),
+        need("Description" %in% names(d), "Description column not found."),
+        need("p.adjust" %in% names(d), "p.adjust column not found.")
+      )
+
+      size_col <- if ("setSize" %in% names(d)) "setSize" else "core_count"
+
+      d$Description <- stringr::str_wrap(d$Description, width = 50)
+      
+      d$Description <- stats::reorder(d$Description, d[[metric_col]])
+
+      return(
+        ggplot2::ggplot(
+          d,
+          ggplot2::aes(
+            x = .data[[metric_col]],
+            y = Description,
+            size = .data[[size_col]],
+            fill = p.adjust
+          )
+        ) +
+          ggplot2::geom_point(
+            aes(fill = p.adjust),
+            shape = 21,
+            colour = "black",
+            stroke = 0.5,
+            alpha = 0.9
+          ) +
+          ggplot2::scale_fill_gradient(
+            low = "#e47f7dff",
+            high = "#5a95c5ff",
+            trans = "reverse"
+          ) +
+          ggplot2::labs(
+            title = title_txt(),
+            x = metric,
+            y = NULL,
+            size = if (size_col == "setSize") "Set size" else "Core genes",
+            fill = "Adjusted p-value"
+          ) +
+          ggplot2::theme_bw(base_size = 12) +
+          ggplot2::theme(
+            plot.title = ggplot2::element_text(face = "bold"),
+            axis.text.y = ggplot2::element_text(size = 10),
+            panel.grid.major.y = ggplot2::element_line(linewidth = 0.2),
+            panel.grid.minor = ggplot2::element_blank()
+          )
+      )
+    }
+    #   d  <- utils::head(df, n)
+    #
+    #   # Compute GeneRatio if missing
+    #   if (!"GeneRatio" %in% names(d)) {
+    #     if ("core_enrichment" %in% names(d) && "setSize" %in% names(d)) {
+    #       core_n <- vapply(
+    #         strsplit(as.character(d$core_enrichment), "/", fixed = TRUE),
+    #         function(v) sum(nzchar(v)),
+    #         integer(1)
+    #       )
+    #       d$GeneRatio <- core_n / as.numeric(d$setSize)
+    #     }
+    #   }
+    #
+    #   metric_col <- switch(metric,
+    #                        "GeneRatio" = "GeneRatio",
+    #                        "NES"       = "NES")
+    #
+    #   # When metric column is missing -> safe fallback
+    #   if (!metric_col %in% names(d)) {
+    #     return(
+    #       ggplot2::ggplot() +
+    #         ggplot2::annotate(
+    #           "text",
+    #           x = 0.5, y = 0.5,
+    #           hjust = 0.5,
+    #           label = sprintf("Metric '%s' not available in results.", metric),
+    #           size = 5
+    #         ) +
+    #         ggplot2::theme_void()
+    #     )
+    #   }
+    #
+    #   # ----------------------------
+    #   # Clean fallback dotplot (ggplot2 only)
+    #   # ----------------------------
+    #   ggplot2::ggplot(
+    #     d,
+    #     ggplot2::aes(
+    #       x = stats::reorder(Description, !!rlang::sym(metric_col)),
+    #       y = !!rlang::sym(metric_col)
+    #     )
+    #   ) +
+    #     ggplot2::geom_point(size = 3, color = "#3366AA") +
+    #     ggplot2::coord_flip() +
+    #     ggplot2::labs(
+    #       title = title_txt(),
+    #       x     = "Term",
+    #       y     = metric
+    #     ) +
+    #     ggplot2::theme_bw(base_size = 12)
+    # }
+
+    # helper to compute how many rows will be drawn (guard against short tables)
+    n_rows_to_plot <- reactive({
+      req(ready())
+      min(as.integer(input$ncat), nrow(r_df()))
+    })
+
+    row_px   <- 50   # pixels per category row (tweak 28 - 34 as you like)
+    marginpx <- 130  # fixed padding for title/axes/legend
+    minpx    <- 380  # minimum so tiny plots still look decent
+
+    dyn_height <- reactive({
+      h <- row_px * n_rows_to_plot() + marginpx
+      max(h, minpx)
+    })
+
+
+    # dynamic left margin based on longest label (keeps full, unwrapped text)
+    left_margin_px <- reactive({
+      req(ready())
+      d <- utils::head(r_df()[, "Description", drop = TRUE], n_rows_to_plot())
+      # 6 px per character is a reasonable default for 12 - 13 pt fonts
+      px <- 6 * max(nchar(d), na.rm = TRUE)
+      px <- max(140, min(px, 320))  # clamp to sensible bounds
+      px
+    })
+
+    # dyn_height() already defined in your server
+    output$plot_gr_ui <- renderUI({
+      req(ready())
+      shinycssloaders::withSpinner(
+        plotOutput(ns("plot_gr"), height = dyn_height()),   # height set in UI
+        type = 4, color = "#005249"
+      )
+    })
+
+    output$plot_nes_ui <- renderUI({
+      req(ready())
+      shinycssloaders::withSpinner(
+        plotOutput(ns("plot_nes"), height = dyn_height()),   # height set in UI
+        type = 4, color = "#005249"
+      )
+    })
+
+    output$plot_gr <- renderPlot({
+      req(ready())
+      make_dotplot("GeneRatio")
+    }, res = 96, height = function() dyn_height())
+
+    output$plot_nes <- renderPlot({
+      req(ready())
+      make_dotplot("NES")
+    }, res = 96, height = function() dyn_height())
+
+
+    output$tbl <- DT::renderDT({
+      req(input$dataset, input$ont)
+      df <- r_df() %>%
+        dplyr::mutate(
+          NES = round(NES, 3)
+        )
+      
+      # choose a sensible subset/order if you like:
+      keep <- intersect(c("ID","Description","NES","p.adjust","setSize","core_count","core_preview"),
+                        names(df))
+      DT::datatable(
+        df[, keep, drop = FALSE],
+        rownames = FALSE,
+        filter   = "top",
+        selection = "single",
+        options = list(pageLength = 10, scrollX = TRUE,
+                       columnDefs = list(
+                         list(targets = which(colnames(df[, keep]) == "core_preview") - 1L,
+                              render = DT::JS(
+                                "function(data,type,row,meta){",
+                                " if(type==='display' && data && data.length>120){",
+                                "   return '<span title=\"'+data+'\">'+data.slice(0,120)+'...</span>';",
+                                " } return data; }"
+                              ))
+                       ))
+      )
+    })
+    # heading
+    output$results_heading <- renderUI({
+      if (isTRUE(input$sig_only)) {
+        h4("GSEA Results (FDR < 0.05)")
+      } else {
+        h4("GSEA Results (all terms)")
+      }
+    })
+    
+    # ---- show genes modal ----
+    observeEvent(input$show_genes, {
+      sel <- input$tbl_rows_selected
+      validate(need(length(sel) == 1, "Select one term in the table first."))
+      df  <- r_df()
+      row <- df[sel, , drop = FALSE]
+
+      # get IDs, then map to symbols for display
+      ids   <- .extract_genes_raw(row)
+      genes <- map_ids_to_symbol(ids)   # pretty names in the modal
+
+      term_title <- if ("Description" %in% names(row)) row$Description[[1]] else "Selected term"
+
+      shiny::showModal(
+        modalDialog(
+          title = term_title,
+          size = "l",
+          easyClose = TRUE,
+          footer = modalButton("Close"),
+          tagList(
+            p(sprintf("Genes in leading edge/core set: %d", length(genes))),
+            tags$div(
+              style = "max-height: 50vh; overflow:auto; font-family: monospace; white-space: pre-wrap;",
+              paste(genes, collapse = ", ")
+            )
+          )
+        )
+      )
+    })
+    # --- download genes CSV ---
+    output$dl_genes_csv <- downloadHandler(
+      filename = function() {
+        sel  <- input$tbl_rows_selected
+        base <- if (length(sel) == 1 && "ID" %in% names(r_df()))
+          paste0("genes_", r_df()$ID[[sel]]) else "genes_selected_term"
+        paste0(gsub("[^A-Za-z0-9_]+", "_", base), ".csv")
+      },
+      contentType = "text/csv; charset=UTF-8",
+      content = function(file) {
+        sel <- input$tbl_rows_selected
+        validate(need(length(sel) == 1, "Select one term in the table first."))
+
+        df  <- r_df()
+        row <- df[sel, , drop = FALSE]
+
+        ids  <- .extract_genes_raw(row)      # cleaned ENSG IDs
+        syms <- map_ids_to_symbol(ids)       # HGNC symbols (or ID fallback)
+
+        out <- data.frame(
+          term_id   = row$ID          %||% NA_character_,
+          term_name = row$Description %||% NA_character_,
+          NES       = row$NES         %||% NA_real_,
+          padj      = row$p.adjust    %||% NA_real_,
+          gene_id   = ids,
+          symbol    = syms,
+          stringsAsFactors = FALSE
+        )
+
+        if (requireNamespace("readr", quietly = TRUE)) {
+          readr::write_excel_csv(out, file)
+        } else {
+          utils::write.csv(out, file, row.names = FALSE)
+        }
+      }
+    )
+
+
+    # ---- downloads ----
+    output$dl_plot_gr_png <- downloadHandler(
+      filename = function() sprintf("dotplot_GeneRatio_%s_%s.png", input$dataset, input$ont),
+      content  = function(file) ggplot2::ggsave(file, make_dotplot("GeneRatio"), width = 7, height = 5, dpi = 300)
+    )
+    output$dl_plot_gr_svg <- downloadHandler(
+      filename = function() sprintf("dotplot_GeneRatio_%s_%s.svg", input$dataset, input$ont),
+      content  = function(file) { svglite::svglite(file, 7, 5); print(make_dotplot("GeneRatio"))
+      grDevices::dev.off() }
+    )
+    output$dl_plot_nes_png <- downloadHandler(
+      filename = function() sprintf("dotplot_NES_%s_%s.png", input$dataset, input$ont),
+      content  = function(file) ggplot2::ggsave(file, make_dotplot("NES"), width = 7, height = 5, dpi = 300)
+    )
+    output$dl_plot_nes_svg <- downloadHandler(
+      filename = function() sprintf("dotplot_NES_%s_%s.svg", input$dataset, input$ont),
+      content  = function(file) { svglite::svglite(file, 7, 5); print(make_dotplot("NES"))
+        grDevices::dev.off() }
+    )
+    output$dl_table_csv <- downloadHandler(
+      filename = function() sprintf("gsea_table_%s_%s.csv", input$dataset, input$ont),
+      content  = function(file) utils::write.csv(r_df(), file, row.names = FALSE)
+    )
+  })
+}

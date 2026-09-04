@@ -1,0 +1,50 @@
+Package: SOD1_main
+Title: XXXX
+Version: 1.0.0
+Authors@R: c(person("Marnie", "Maddock", role = c("aut","cre"), email = "mlm715@uowmail.edu.au"))
+Description: 
+License: MIT + file LICENSE
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+Depends: R (>= 4.3)
+Imports:
+    arrow,
+    shiny,
+    fontawesome,
+    dplyr,
+    magrittr,
+    purrr,
+    ggplot2,
+    bslib,
+    plotly,
+    stringr,
+    rlang,
+    metafor,
+    shinyjs,
+    shinycssloaders,
+    svglite,
+    tibble,
+    readr,
+    ggVennDiagram,
+    circlize,
+    tidyr,
+    grid,
+    DT,
+    memoise, 
+    ragg,
+    data.table,
+    htmltools,
+    patchwork,
+    glue,
+    ComplexHeatmap,
+    SummarizedExperiment,
+    magick,
+    DESeq2,
+    AnnotationDbi,
+    org.Hs.eg.db
+Suggests:
+    BiocManager
+URL: https://github.com/MarnieMaddock/FRDATranscriptomicAtlas
+BugReports: https://github.com/MarnieMaddock/FRDATranscriptomicAtlas/issues
+Config/Needs/website: true
+Config/roxygen2/version: 8.0.0

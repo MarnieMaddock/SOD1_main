@@ -1,0 +1,305 @@
+#' DEGs-by-dataset UI module
+#'
+#' @param id Module id
+#' @return A Shiny UI for exploring DEGs by dataset
+#' @noRd
+degTablesSidebarUI <- function(id) {
+  ns <- NS(id)
+  tagList(
+    h4("Differentially Expressed Genes (DEGs) Explorer"),
+
+    radioButtons(
+      ns("feature_level"),
+      label = "Level",
+      choices = c("Genes" = "genes"),
+      selected = "genes"
+    ),
+
+    selectizeInput(
+      ns("dataset"),
+      "Dataset",
+      choices = NULL, multiple = FALSE,
+      options = list(placeholder = "Select a dataset...")
+    ),
+    radioButtons(
+      ns("p_filter_mode"),
+      "Adjusted P-value Threshold",
+      inline = FALSE,
+      choiceNames = list(
+        "None",
+        HTML("&le; 0.10"),
+        HTML("&le; 0.05"),
+        HTML("&le; 0.01"),
+        HTML("&le; 0.001")
+      ),
+      choiceValues = list(
+        NA,
+        0.10,
+        0.05,
+        0.01,
+        0.001
+      ),
+      selected = 0.05
+    ),
+    numericInput(
+      ns("lfc_min"),
+      label = "Minimum |log2FC|",
+      value = 0, min = 0, max = 10, step = 0.1
+    ),
+    radioButtons(
+      ns("direction"),
+      label = "Direction",
+      inline = TRUE,
+      choices = c("Both" = "both", "Up" = "up", "Down" = "down"),
+      selected = "both"
+    ),
+    strong("Download"),
+    br(),
+    downloadButton(ns("download_filtered"), "Download as CSV")
+  )
+}
+
+#' Main area for DEG explorer (summary + table)
+#' @noRd
+degTablesMainUI <- function(id) {
+  ns <- NS(id)
+  tagList(
+    br(),
+    uiOutput(ns("summary_bar")),
+    shinycssloaders::withSpinner(
+      DT::dataTableOutput(ns("deg_table"), width = "100%"),
+      type = 4,  color = "#005249"
+    )
+  )
+}
+
+#' Server logic for DEG-by-dataset (robust for package + project)
+#' @noRd
+#'
+degTablesServer <- function(id, pkg = "SOD1_main") {
+  moduleServer(id, function(input, output, session) {
+    ns <- session$ns
+
+    # --- make pkg safe (length-1 string) ---------------------------------
+    pkg <- tryCatch(pkg, error = function(e) "")
+    if (!length(pkg) || !is.character(pkg) || !nzchar(pkg)) pkg <- "SOD1_main"
+    pkg <- pkg[[1L]]
+
+
+    tx2_path <- system.file(
+      "extdata", "maps", "tx2gene.tsv",
+      package = pkg,
+      mustWork = FALSE
+    )
+
+    tx2 <- if (nzchar(tx2_path) && file.exists(tx2_path)) {
+      readr::read_tsv(tx2_path, col_types = "ccc") |> dplyr::distinct()
+    } else NULL
+
+    gene_map <- if (!is.null(tx2)) {
+      dplyr::select(tx2, gene_id, gene_name) |>
+        dplyr::distinct() |>
+        dplyr::rename(symbol = gene_name)
+    } else NULL
+
+    read_cached <- memoise::memoise(readRDS)
+
+    # ---------- manifest of DEG files ----------
+    manifest <- reactiveVal(NULL)
+
+    observeEvent(TRUE, {
+      m <- get_deg_manifest()
+      manifest(m)
+
+    }, once = TRUE)
+
+    # ---------- dataset dropdown ----------
+    `%||%` <- function(a,b) if (is.null(a)) b else a
+    # --- load pretty_map from package namespace (internal object) ----------
+    pretty_map <- tryCatch(
+      get("pretty_map", envir = asNamespace(pkg)),
+      error = function(e) {
+        warning("pretty_map could not be found; using empty vector.")
+        character(0)
+      }
+    )
+
+
+    observeEvent(input$feature_level, {
+
+      m <- req(manifest())
+      lvl <- input$feature_level %||% "genes"
+
+      avail_ids <- sort(unique(m$dataset[m$level == lvl]))
+
+      pm_sub <- pretty_map[avail_ids]
+      pm_sub[is.na(pm_sub)] <- avail_ids[is.na(pm_sub)]
+      labelled_choices <- stats::setNames(avail_ids, pm_sub)
+
+      updateSelectizeInput(
+        session,
+        "dataset",
+        choices = c("Select a dataset..." = "", labelled_choices),
+        selected = "",
+        server = TRUE
+      )
+
+    }, ignoreInit = FALSE)
+
+    # ---------- file selection ----------
+    file_sel <- reactive({
+      req(input$dataset, input$feature_level)
+      m <- manifest()
+      threshold <- padj_max_to_threshold(suppressWarnings(as.numeric(input$p_filter_mode)))
+      cand <- dplyr::filter(
+        m,
+        dataset == input$dataset,
+        level == input$feature_level,
+        threshold == threshold
+      )
+      if (nrow(cand)) cand$path[1] else NULL
+    })
+    # ---------- main data reactive ----------
+    dat <- reactive({
+      req(input$dataset, input$feature_level)
+      fp <- file_sel()
+
+      thr <- suppressWarnings(as.numeric(input$p_filter_mode))
+      lfc_min <- input$lfc_min %||% 0
+      dir <- input$direction %||% "both"
+
+      x <- get_deg_data(
+        dataset = input$dataset,
+        level = input$feature_level,
+        file_path = fp,
+        padj_max = thr,
+        lfc_min = lfc_min,
+        direction = dir
+      )
+
+      # ID column by level
+      lvl <- input$feature_level %||% "genes"
+      id_col <- if (identical(lvl, "genes")) "ensembl_gene_id" else "transcript_id"
+
+      if (!(id_col %in% names(x)) && !is.null(rownames(x))) {
+        x <- tibble::rownames_to_column(x, var = id_col)
+      }
+
+      # Fix occasional mislabeled IDs
+      if (identical(lvl, "transcripts") &&
+          ("ensembl_gene_id" %in% names(x)) && !("transcript_id" %in% names(x)) &&
+          any(grepl("^ENST", utils::head(x$ensembl_gene_id, 20)))) {
+        x <- dplyr::rename(x, transcript_id = ensembl_gene_id)
+      }
+
+      if (identical(lvl, "genes") &&
+          ("transcript_id" %in% names(x)) && !("ensembl_gene_id" %in% names(x)) &&
+          any(grepl("^ENSG", utils::head(x$transcript_id, 20)))) {
+        x <- dplyr::rename(x, ensembl_gene_id = transcript_id)
+      }
+
+      # standardize columns
+      if (!"log2FoldChange" %in% names(x)) {
+        if ("log2FC" %in% names(x)) {
+          x <- dplyr::rename(x, log2FoldChange = log2FC)
+        } else if ("beta" %in% names(x)) {
+          x <- dplyr::rename(x, log2FoldChange = beta)
+        }
+      }
+
+      if (!"padj" %in% names(x) && "qvalue" %in% names(x)) {
+        x <- dplyr::rename(x, padj = qvalue)
+      }
+
+
+      # symbols mapping
+      if (identical(lvl, "genes")) {
+        if (!is.null(gene_map) && "ensembl_gene_id" %in% names(x)) {
+          x <- dplyr::left_join(x, gene_map, by = c("ensembl_gene_id" = "gene_id")) |>
+            dplyr::relocate(ensembl_gene_id, symbol, .before = dplyr::everything())
+        }
+      } else {
+        if (!is.null(tx2) && "transcript_id" %in% names(x)) {
+          x <- dplyr::left_join(x, tx2, by = "transcript_id") |>
+            dplyr::rename(symbol = gene_name) |>
+            dplyr::relocate(transcript_id, gene_id, symbol, .before = dplyr::everything())
+        }
+      }
+
+      # round numeric columns except pvalue and padj
+      x <- x |>
+        dplyr::mutate(
+          dplyr::across(
+            .cols = dplyr::where(is.numeric) & !dplyr::any_of(c("pvalue", "padj")),
+            ~ round(.x, 4)
+          )
+        )
+      x <- x |>
+        mutate(
+          pvalue = signif(pvalue, 3),
+          padj   = signif(padj, 3)
+        )
+
+      x
+    })
+
+    # ---------- UI bits ----------
+    pretty_label <- function(id) pretty_map[[id]] %||% id
+
+    output$summary_bar <- renderUI({
+      req(dat())
+      x <- dat()
+
+      tags$div(
+        class = "alert alert-info",
+        HTML(sprintf(
+          "Level: %s | Dataset: %s | p &le; %s | |log2FC| &ge; %s | Number of Results: %s",
+          input$feature_level,
+          pretty_label(input$dataset),
+          input$p_filter_mode,
+          input$lfc_min,
+          format(nrow(x), big.mark = ",")
+        ))
+      )
+    })
+
+
+    output$deg_table <- DT::renderDataTable({
+
+      # Show placeholder if no dataset selected
+      if (is.null(input$dataset) || input$dataset == "") {
+        return(
+          DT::datatable(
+            data.frame(Message = "Please select a dataset"),
+            options = list(dom = "t"),
+            rownames = FALSE
+          )
+        )
+      }
+
+      # Normal table
+      req(dat())
+
+      DT::datatable(
+        dat(),
+        filter = "top",
+        rownames = FALSE,
+        extensions = "Buttons",
+        options = list(
+          dom = "Bfrtip",
+          buttons = "copy",
+          pageLength = 25,
+          deferRender = TRUE,
+          scrollX = TRUE
+        )
+      )
+
+    }, server = TRUE)
+
+    output$download_filtered <- downloadHandler(
+      filename = function() sprintf("DEG_%s_%s_p%s_filtered.csv",
+                                    input$feature_level, input$dataset, input$p_filter_mode),
+      content  = function(file) readr::write_csv(dat(), file)
+    )
+  })
+}

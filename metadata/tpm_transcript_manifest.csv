@@ -1,0 +1,16 @@
+dataset,filename
+Chutake,Chutake_transcript_tpm.rds
+Erwin,Erwin_transcript_tpm.rds
+Indelicato,Indelicato_transcript_tpm.rds
+Lai_CNS,Lai_CNS_transcript_tpm.rds
+Lai_iPSC,Lai_iPSC_transcript_tpm.rds
+Lai_PNS,Lai_PNS_transcript_tpm.rds
+Lees,Lees_transcript_tpm.rds
+Li,Li_transcript_tpm.rds
+Maddock_LMN,Maddock_LMN_transcript_tpm.rds
+Maddock_NCC,Maddock_NCC_transcript_tpm.rds
+Maddock_SN,Maddock_SN_transcript_tpm.rds
+Mishra,Mishra_transcript_tpm.rds
+Napierala,Napierala_transcript_tpm.rds
+Vilema,Vilema_transcript_tpm.rds
+Wang,Wang_transcript_tpm.rds
